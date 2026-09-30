@@ -1,0 +1,25 @@
+{
+  "name": "mm1k-capacity-service",
+  "version": "1.0.0",
+  "description": "M/M/1/K 有限容量单服务台排队核算服务：稳态解析 + 离散事件仿真对照",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "test": "node --import tsx --test test/analytic.test.ts test/simulation.test.ts test/api.test.ts"
+  },
+  "dependencies": {
+    "express": "^4.22.3"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.25",
+    "@types/node": "^20.17.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}
