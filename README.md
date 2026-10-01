@@ -38,6 +38,26 @@
 - 平均队长、利用率均为时间加权平均（状态对时间积分 / 时域长度）；
   经验阻塞比例 = 被拒到达数 / 总到达尝试数。
 
+## 并发与执行模型
+
+长时域仿真（如 `maxTime=5e7`）纯 CPU 且要跑数秒，若放在 HTTP 主线程会整段
+堵死事件循环。因此：
+
+- **仿真在工作线程池（`worker_threads`）里执行**，主线程始终空闲；长仿真
+  跑满 CPU 期间，`/health` 与 `/api/analytic`（纯解析、微秒级）仍在毫秒级应答。
+- 池大小默认 `min(可用并行度, 8)`，可用环境变量 `SIMULATION_WORKERS` 覆盖；
+  超出的仿真请求排队（先到先得），不影响主线程上的短请求。
+- **调用方在结果返回前断开**：排队中的任务直接出队，运行中的任务立即
+  `terminate()` 对应线程，计算在毫秒级真正停下，不再拖住后续请求。
+- 每个任务使用独立的 worker isolate，RNG 状态与堆内存物理隔离；线程只换
+  执行单元，不改仿真逻辑，所以同 seed 单独跑、并发跑、途中让出都**逐位一致**。
+- worker 启动失败或计算中途出错回结构化的
+  `500 { error, code: 'SIMULATION_FAILED' }`，服务进程不退出；连接仍在但任务
+  被放弃（如关闭中）回 `503 { error, code: 'SIMULATION_ABORTED' }`。
+
+详见根目录《并发改造说明.md》。
+
+
 ## HTTP 接口
 
 | 方法 | 路径 | 说明 |
@@ -100,12 +120,16 @@ src/
   simulation/
     rng.ts                    mulberry32 随机数发生器 + 指数抽样
     event-list.ts             最小堆事件表
-    engine.ts                 离散事件仿真引擎
+    engine.ts                 离散事件仿真引擎（逐位确定，主线程/工作线程共用）
+    simulation-worker.ts      工作线程入口：在独立 isolate 里跑一次仿真
+    worker-bootstrap.mjs      工作线程引导（开发走 tsx，生产走编译后的 .js）
+    worker-pool.ts            固定大小工作线程池：排队 / 取消 / 错误兜底
   metrics/metrics.ts          时间加权累加器与对照表汇总
   validation/validation.ts    输入校验（解析/仿真/路由共用）
-  routes/queue-routes.ts      三个业务接口
-  app.ts / server.ts          Express 装配与启动
-test/                         解析、仿真、HTTP 三层自动化测试
+  routes/queue-routes.ts      三个业务接口（仿真绑定连接生命周期，可取消）
+  app.ts / server.ts          Express 装配、线程池生命周期与优雅关闭
+scripts/copy-worker-bootstrap.mjs  构建时把 .mjs 引导拷到 dist/
+test/                         解析、仿真、HTTP、并发回归四层自动化测试
 ```
 
 ## 关键回归测试

@@ -1,8 +1,19 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
-import queueRoutes from './routes/queue-routes.js';
+import { createQueueRouter } from './routes/queue-routes.js';
 import { ValidationError } from './validation/validation.js';
+import {
+  SimulationExecutionError,
+  SimulationWorkerPool,
+} from './simulation/worker-pool.js';
 
-export function createApp() {
+/**
+ * 装配 Express 应用。
+ *
+ * 仿真工作线程池在此创建并随应用生命周期回收：HTTP server 关闭（含
+ * SIGTERM/SIGINT、自动化测试 server.close）时统一 destroy，避免线程泄漏。
+ */
+export function createApp(pool?: SimulationWorkerPool) {
+  const simulationPool = pool ?? new SimulationWorkerPool();
   const app = express();
   app.use(express.json({ limit: '256kb' }));
 
@@ -10,7 +21,7 @@ export function createApp() {
     res.json({ status: 'ok' });
   });
 
-  app.use('/api', queueRoutes);
+  app.use('/api', createQueueRouter(simulationPool));
 
   // 404
   app.use((req: Request, res: Response) => {
@@ -26,6 +37,11 @@ export function createApp() {
     }
     if (err instanceof SyntaxError && 'body' in err) {
       res.status(400).json({ error: '请求体不是合法 JSON' });
+      return;
+    }
+    if (err instanceof SimulationExecutionError) {
+      // 已开始的计算中途失败：结构化 500，绝不回看似正常的结果
+      res.status(500).json({ error: err.message, code: 'SIMULATION_FAILED' });
       return;
     }
     const message = err instanceof Error ? err.message : '内部错误';
