@@ -2,6 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import { createApp } from '../src/app.js';
+import { getSimulationPool } from '../src/simulation/pool.js';
 
 let server: Server;
 let base: string;
@@ -19,6 +20,8 @@ after(async () => {
   await new Promise<void>((resolve, reject) =>
     server.close((err) => (err ? reject(err) : resolve())),
   );
+  // 仿真在 worker 线程执行，显式回收，避免空闲线程挂住测试进程
+  await getSimulationPool().shutdown();
 });
 
 async function post(path: string, body: unknown) {

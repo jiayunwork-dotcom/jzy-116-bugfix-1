@@ -66,21 +66,62 @@
 
 校验规则：`lambda`、`mu` 必须为正数，`capacity` 必须为正整数，
 `seed` 为 `[0, 2^32-1]` 内整数（缺省 1），停止条件至少提供一个。
-非法输入返回 `400` 与错误信息。
+非法输入返回 `400` 与错误信息（信息中注明是哪个字段）。
 
 `/api/compare` 的 `comparison` 字段逐项给出 `analytic`、`simulation`、`absoluteDifference`。
+
+## 并发模型与长时域仿真
+
+仿真是一段纯 CPU 热循环，历史版本在主事件循环里同步执行，单个长仿真
+（如 `maxTime=5e7`，约 7 秒、5 千万事件）会在运行期间饿死整个进程：
+健康检查、解析请求、其它仿真全部排队等待，调用方断开也无人感知。
+
+现在的实现（见“模块划分”）：
+
+- **仿真放进固定数量的 worker 线程并行执行**（`simulation/pool.ts` +
+  `simulation/sim-worker.ts`）。主线程只做 HTTP 收发与作业调度，因此长仿真
+  运行期间 `/health` 与 `/api/analytic` 始终在毫秒级应答；多组长仿真由不同
+  worker 真并行，不再首尾相接。
+- **worker 内部分段推进、定期让出**：仿真主循环被拆成“每次处理一个事件”
+  的 `step()`，worker 每处理约 10 万个事件用 `setImmediate` 让出一次，并在
+  分片边界检查取消信号。
+- **调用方断开即取消**：响应在结束前关闭时，路由通过 `AbortController` 通知
+  worker，worker 在当前分片结束（几十毫秒内）就停止，不再空耗 CPU；被放弃的
+  计算不会返回看似正常的结果。连接仍存活却被取消时返回结构化 `499`；
+  计算中途出错 / worker 崩溃返回结构化 `500`，进程不挂、错误不静默。
+- **并发上限**：默认 `min(可用 CPU 核数, 4)`，可用环境变量 `SIM_WORKERS`
+  覆盖；超出上限的作业排队，排队期间被取消则立即放弃。纯解析 `/api/analytic`
+  不占 worker，永远即时应答。
+
+### 为什么分段 / 并行之后同一种子仍逐位相同
+
+仿真的全部可变状态——mulberry32 的 32 位状态、最小堆事件表、时间加权
+累加器、系统人数与仿真时钟——都是单个 `SimulationRunner` 的实例局部状态，
+不接触任何共享可变量。分段让出只发生在“两个事件之间”：恢复后接着弹出并
+处理下一个事件，没有任何事件被重放或跳过，RNG 的调用次序也完全不变。
+多个仿真无论在多个 worker 里并行、还是在同一线程交错分段，都各自拥有独立
+的 RNG 与统计量，随机数序列不会串线。因此同一组输入（含种子）无论单独跑、
+并发跑还是中途让出，结果逐字段、逐位一致。
+
+> 连接卫生：调用方在响应完成前断开时，服务端会立即销毁该 TCP 连接，使其
+> 不能再被 keep-alive 复用。若客户端在 abort 之后长时间阻塞自己的事件循环
+> （例如同一 Node 进程内同步跑数秒 CPU），来不及处理本端发出的连接关闭，
+> 仍可能错误复用一条已死连接——那是客户端未消费 TCP 状态所致，正常不阻塞
+> 事件循环的调用方不受影响。
 
 ## 本地运行（Node.js 20）
 
 ```bash
 npm ci
 npm run build
-npm start                 # 默认 8080，可用 PORT 覆盖
-npm test                  # node:test 自动化测试（解析/仿真/接口）
+npm start                 # 默认 8080，可用 PORT 覆盖；SIM_WORKERS 调并发
+npm test                  # node:test 自动化测试（解析/仿真/接口/并发回归）
 npm run typecheck
 ```
 
-开发模式：`npm run dev`（tsx watch）。
+开发模式：`npm run dev`（tsx watch）。worker 入口在生产下加载编译后的
+`dist/simulation/sim-worker.js`；源码直跑（tsx）时通过 tsx 的 `tsImport`
+加载同一份 `.ts` 源码，两条路径结果语义一致，生产镜像裁剪掉 tsx 后无需它。
 
 ## Docker
 
@@ -100,13 +141,17 @@ src/
   simulation/
     rng.ts                    mulberry32 随机数发生器 + 指数抽样
     event-list.ts             最小堆事件表
-    engine.ts                 离散事件仿真引擎
+    engine.ts                 仿真引擎：可分段推进的 SimulationRunner + runSimulation
+    worker-protocol.ts        主线程 ↔ worker 的消息与结构化错误约定
+    sim-worker.ts             worker 入口：分片推进、让出、响应取消
+    pool.ts                   固定并发 worker 池：调度、排队、取消、故障重建
   metrics/metrics.ts          时间加权累加器与对照表汇总
   validation/validation.ts    输入校验（解析/仿真/路由共用）
   routes/queue-routes.ts      三个业务接口
-  app.ts / server.ts          Express 装配与启动
-test/                         解析、仿真、HTTP 三层自动化测试
+  app.ts / server.ts          Express 装配、连接安全与启动/关闭
+test/                         解析、仿真、HTTP、并发回归四层自动化测试
 ```
+
 
 ## 关键回归测试
 
@@ -115,3 +160,14 @@ test/                         解析、仿真、HTTP 三层自动化测试
 - λ、μ 同比例放大（比值不变）：稳态分布形状不变；
 - 预置算例 λ=0.8、μ=1（ρ=0.8）、K=200：平均队长收敛到无限容量
   经典闭式 `L = ρ/(1-ρ) = 4`、`W = 1/(μ-λ) = 5`。
+
+并发回归（`test/concurrency.test.ts`，使用真实量级长仿真）：
+
+- 长仿真（`maxTime=5e7`）运行期间，健康检查与纯解析请求 < 200ms，且
+  5e7 请求被接受、结果（49,992,828 次尝试 / 119,053 次拒绝）逐位正确；
+- 客户端断开后，计算在分片边界（< 1s）内停止并释放 worker，后续请求不被拖住；
+- 两个 `maxTime=2e7` 的长对照并发提交，结果与各自单独运行的历史快照
+  `deepEqual`（逐字段、逐位），两组随机数序列各自独立；CPU 充足时并发总耗时
+  明显小于单独耗时之和；
+- 排队作业取消、服务关闭两种放弃路径都以结构化错误结束，不返回正常结果。
+
