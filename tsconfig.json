@@ -11,9 +11,13 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
+    // worker 线程入口是普通 JS（避免 worker 再走 TS 加载链），需要 tsc
+    // 把它一并拷进 dist；不做类型检查，保持入口零依赖、极简
+    "allowJs": true,
+    "checkJs": false,
     "declaration": false,
     "sourceMap": true
   },
-  "include": ["src/**/*.ts"],
+  "include": ["src/**/*.ts", "src/**/*.js"],
   "exclude": ["node_modules", "dist"]
 }
